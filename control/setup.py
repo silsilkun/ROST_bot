@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            "Demo=control.nodes.recycle_demo:main",
         ],
     },
 )
