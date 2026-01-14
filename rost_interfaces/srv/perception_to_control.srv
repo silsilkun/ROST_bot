@@ -1,4 +1,16 @@
-rost_interfaces/Float64Array[] values
+# Request (control -> Perception)
+bool Request
+
+---
+# Response (Perception -> control)
+
+# objects_flat [id, x, y, z, angle] * N
+float32[] objects_flat
+
+# object_count = N (편의용)
+
+# success / message
+# rost_interfaces/Float64Array[] values
 ---
 bool success
 string message
