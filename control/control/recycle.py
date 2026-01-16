@@ -19,8 +19,8 @@ wait_offset = max(0.0, VEL - BASE_VEL) * WAIT_SEC_PER_VEL
 # 로봇팔 오프셋
 PICK_APPROACH = 150
 PICK_DESCENT = 90
-LIFT = 250
-PLACE_APPROACH = 250
+LIFT = 280
+PLACE_APPROACH = 300
 PLACE_DESCENT = 130
 LIFT_2 = 250
 # 그리퍼 오프셋
@@ -36,6 +36,28 @@ class Recycle(Node):
 
         self.gripper = None
         self.gripper = GripperController(node=self, namespace = ROBOT_ID)
+
+    def _get_current_posx_with_retry(self, get_current_posx, wait_fn, retries=3, delay=0.1):
+        for attempt in range(1, retries + 1):
+            try:
+                result = get_current_posx()
+            except Exception as exc:
+                self.get_logger().warn(f"get_current_posx failed (attempt {attempt}/{retries}): {exc}")
+                result = None
+
+            if result:
+                cur_posx, sol = result
+                if cur_posx is not None:
+                    try:
+                        if len(cur_posx) >= 6:
+                            return cur_posx, sol
+                    except TypeError:
+                        pass
+
+            if wait_fn:
+                wait_fn(delay)
+
+        return None, None
 
     def _normalize_trash_list(self, trash_list):
         if not trash_list:
@@ -56,11 +78,12 @@ class Recycle(Node):
             z = float(trash[3]) * 10.0
         pick_xyz = (float(trash[1]) * 10.0, float(trash[2]) * 10.0, z)
         angle = float(trash[4])
+        grab_offset = 220 if float(trash[0]) == 0.0 else 0
         place_xyz = (float(bin[0]) * 10.0, float(bin[1]) * 10.0, 140)
-        return {"id": item_id, "pick": pick_xyz, "angle": angle, "place": place_xyz}
+        return {"id": item_id, "pick": pick_xyz, "angle": angle, "place": place_xyz, "grab_offset": grab_offset}
     
     # 동작 시퀀스
-    def pap_sequence(self, pick_xyz, grip_angle, place_xyz):
+    def pap_sequence(self, pick_xyz, grip_angle, place_xyz, grab_offset=0):
         from DSR_ROBOT2 import (
                 movej,
                 movel,
@@ -98,7 +121,10 @@ class Recycle(Node):
         movej(gripper_turn,VEL, ACC)
 
         # 현재 자세의 회전값을 유지
-        cur_posx, _ = get_current_posx()
+        cur_posx, _ = self._get_current_posx_with_retry(get_current_posx, wait)
+        if cur_posx is None:
+            self.get_logger().error("get_current_posx returned empty data; aborting sequence")
+            return
         rx, ry, rz = cur_posx[3], cur_posx[4], cur_posx[5]
 
         # pick 지점으로 하강
@@ -106,7 +132,7 @@ class Recycle(Node):
         movel(pick_lower, VEL, ACC)
 
         # pick 그리퍼 집기
-        self.gripper.move(GRAB)
+        self.gripper.move(GRAB + grab_offset)
         wait(GRAB_WAIT)
 
         # pick 이후 상단 이동
@@ -142,7 +168,7 @@ class Recycle(Node):
             scaled = [item[0]]
             for idx, value in enumerate(item[1:], start=1):
                 if idx == 4:
-                    scaled.append(round(float(value) / 10.0, 2))
+                    scaled.append(round(float(value) , 2))
                 else:
                     scaled.append(round(float(value) * 10.0, 2))
             debug_trash.append(scaled)
@@ -153,8 +179,17 @@ class Recycle(Node):
                 continue
             debug_bin.append([round(float(v) * 10.0, 2) for v in item])
 
-        print(f"[Recycle] trash_list={debug_trash}")
-        print(f"[Recycle] bin_list={debug_bin}")
+        print("[Recycle]")
+        print("trash_list=[")
+        for item in debug_trash:
+            print(f"{item},")
+        print("]")
+
+        print("[Recycle]")
+        print("bin_list=[")
+        for item in debug_bin:
+            print(f"{item},")
+        print("]")
 
         
         
@@ -177,7 +212,7 @@ class Recycle(Node):
                 continue
 
             job = self.create_job(trash, bin_data)
-            self.pap_sequence(job["pick"], job["angle"], job["place"])
+            self.pap_sequence(job["pick"], job["angle"], job["place"], job["grab_offset"])
             print(f"{item_type}을 분리수거 완료했습니다")
 
     def _type_to_id(self, value):
