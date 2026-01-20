@@ -10,12 +10,14 @@ ROBOT_MODEL = "e0509"
 VEL = 100
 ACC = 50
 
+# wait 오프셋
 BASE_VEL = 20.0
 MAX_VEL = 100.0
-WAIT_SEC_PER_VEL = 0.03
+WAIT_SEC_PER_VEL = 0.03  # 이 값을 수정
 
 VEL = min(VEL, MAX_VEL)
 wait_offset = max(0.0, VEL - BASE_VEL) * WAIT_SEC_PER_VEL
+
 # 로봇팔 오프셋
 PICK_APPROACH = 150
 PICK_DESCENT = 90
@@ -23,6 +25,7 @@ LIFT = 280
 PLACE_APPROACH = 300
 PLACE_DESCENT = 130
 LIFT_2 = 250
+
 # 그리퍼 오프셋
 GRAB = 500
 RELEASE = 0
@@ -37,7 +40,8 @@ class Recycle(Node):
         self.gripper = None
         self.gripper = GripperController(node=self, namespace = ROBOT_ID)
 
-    def _get_current_posx_with_retry(self, get_current_posx, wait_fn, retries=3, delay=0.1):
+    # 로봇팔의 현재 포즈
+    def get_posx(self, get_current_posx, wait_fn, retries=3, delay=0.1):
         for attempt in range(1, retries + 1):
             try:
                 result = get_current_posx()
@@ -59,6 +63,7 @@ class Recycle(Node):
 
         return None, None
 
+    # trash_list -> 5개씩 묶인 2차원 리스트로 재정의
     def _normalize_trash_list(self, trash_list):
         if not trash_list:
             return []
@@ -71,7 +76,7 @@ class Recycle(Node):
 
     # 입력 리스트를 검증하고 작업 딕셔너리로 전환
     def create_job(self, trash, bin):
-        item_id = self._type_to_id(trash[0])
+        item_id = self.type_id(trash[0])
         if float(trash[0]) == 0.0:
             z = 160.0
         else:
@@ -121,7 +126,7 @@ class Recycle(Node):
         movej(gripper_turn,VEL, ACC)
 
         # 현재 자세의 회전값을 유지
-        cur_posx, _ = self._get_current_posx_with_retry(get_current_posx, wait)
+        cur_posx, _ = self.get_posx(get_current_posx, wait)
         if cur_posx is None:
             self.get_logger().error("get_current_posx returned empty data; aborting sequence")
             return
@@ -159,8 +164,10 @@ class Recycle(Node):
         home = posj(0, 0, 90, 0, 90, 0)
         movej(home, VEL, ACC)
 
-    # 데이터 > 작업 순차 처리
+    # 로봇팔 작업 순서
     def run(self, trash_list, bin_list):
+
+        # trash_list , bin_list 좌표값 디버깅
         debug_trash = []
         for item in trash_list:
             if not item:
@@ -191,16 +198,16 @@ class Recycle(Node):
             print(f"{item},")
         print("]")
 
-        
-        
+        # 처리할 정보가 없으면 작업 중단
         trash_items = self._normalize_trash_list(trash_list)
         if not trash_items or not bin_list:
             return
 
+        # type별로 bin을 하나씩 매청 같을 시 같은 bin으로 계속 처리
         type_to_bin = {}
         next_bin_index = 0
         for trash in trash_items:
-            item_type = self._type_to_id(trash[0])
+            item_type = self.type_id(trash[0])
             if item_type not in type_to_bin:
                 if next_bin_index >= len(bin_list):
                     continue
@@ -215,7 +222,8 @@ class Recycle(Node):
             self.pap_sequence(job["pick"], job["angle"], job["place"], job["grab_offset"])
             print(f"{item_type}을 분리수거 완료했습니다")
 
-    def _type_to_id(self, value):
+    # ID별로 type 이름 지정해주기
+    def type_id(self, value):
         mapping = {
             0.0: "PLASTIC",
             1.0: "CAN",
