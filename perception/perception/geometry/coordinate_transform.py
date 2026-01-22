@@ -3,7 +3,7 @@ import os
 import numpy as np
 import cv2
 
-from .settings import CALIB_PATH
+from ..config.settings import CALIB_PATH
 
 
 class Coordinate:

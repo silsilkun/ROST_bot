@@ -1,5 +1,5 @@
-from .gemini_api import GeminiClient
-from .utils import parse_labels_from_text, convert_labels_to_ids
+from ..llm.gemini_client import GeminiClient
+from ..utils.utils import parse_labels_from_text, convert_labels_to_ids
 
 
 class EstimationLogic:

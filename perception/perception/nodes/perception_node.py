@@ -1,6 +1,6 @@
-from perception.utils import pipeline
-from perception.utils import realsense_loop
-from perception.utils import click_points
+from perception.perception.pipelines import perception_pipeline
+from perception.perception.runtime import realsense_runtime
+from perception.perception.runtime import click_input_ui
 
 from rost_interfaces.srv import PerceptionToEstimation
 
@@ -19,13 +19,13 @@ class PerceptionNode(Node):
             self.get_logger().info('service not available, waiting again...')
         self.req = PerceptionToEstimation.Request()
 
-        self.processed_result = realsense_loop.run(
-                on_save=pipeline.save_cam,
-                on_reset=click_points.reset_points,
-                on_click=click_points.mouse_callback,
-                update_depth_frame=click_points.update_depth_frame,
-                update_color_image=click_points.update_color_image,
-                get_points=click_points.click_points.get_saved_points,
+        self.processed_result = realsense_runtime.run(
+                on_save=perception_pipeline.save_cam,
+                on_reset=click_input_ui.reset_points,
+                on_click=click_input_ui.mouse_callback,
+                update_depth_frame=click_input_ui.update_depth_frame,
+                update_color_image=click_input_ui.update_color_image,
+                get_points=click_input_ui.click_points.get_saved_points,
         )
 
     def send_request(self):

@@ -14,9 +14,9 @@ except Exception:
     load_dotenv = None
 from cv_bridge import CvBridge
 
-from estimation.utils.prompt import PromptConfig
+from estimation.estimation.prompt.prompt_config import PromptConfig
 from estimation.utils.utils import validate_waste_coordinates_flat, ros_image_to_bgr_numpy, bgr_numpy_to_jpeg_bytes
-from estimation.utils.logic import EstimationLogic
+from estimation.estimation.logic.estimation_logic import EstimationLogic
 
 
 class EstimationJudgeNode(Node):

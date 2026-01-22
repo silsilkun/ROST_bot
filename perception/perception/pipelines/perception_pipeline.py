@@ -3,11 +3,11 @@ import os
 import numpy as np
 import cv2
 
-from . import click_points
-from .detector import DepthDBSCANVisualizer
-from . import depth_utils
-from .coordinate import Coordinate
-from .settings import OUTPUT_DIR, COLOR_PATH, DEPTH_PATH
+from ..runtime import click_input_ui
+from ..detection.depth_dbscan_detector import DepthDBSCANVisualizer
+from ..geometry import depth_geometry
+from ..geometry.coordinate_transform import Coordinate
+from ..config.settings import OUTPUT_DIR, COLOR_PATH, DEPTH_PATH
 
 # detector 인스턴스 (기존과 동일)
 detector = DepthDBSCANVisualizer()
@@ -42,7 +42,7 @@ def save_cam():
     global color_image, depth_image, points_3d, processed_result
 
     # 1) 스냅샷 + 클릭포인트 3D 계산
-    color, depth, points = click_points.Save_Cam()
+    color, depth, points = click_input_ui.Save_Cam()
     color_image = color
     depth_image = depth
     points_3d = points  # [(X,Y,Z), ...] (클릭 기반 world)
@@ -75,7 +75,7 @@ def save_cam():
     boxes = [it["poly"] for it in items]
 
     # 4) world_list 생성 (초록 + 파랑, id 유지)
-    fake_depth = depth_utils.FakeDepthFrameFromNpy(depth)
+    fake_depth = depth_geometry.FakeDepthFrameFromNpy(depth)
     coord = Coordinate()
 
     world_list = []
@@ -85,7 +85,7 @@ def save_cam():
 
         Pw = None
         if obj_type == "green":
-            cx, cy = depth_utils.box_center_pixel(it["poly"])
+            cx, cy = depth_geometry.box_center_pixel(it["poly"])
             Pw = coord.pixel_to_world(cx, cy, fake_depth)
 
             # 1) detector에서 온 긴변 각도 (0~180, 90이 수직)
@@ -103,7 +103,7 @@ def save_cam():
                         
         else:
             # blue: 안전 탐색 + angle=0.0
-            Pw = depth_utils.blue_rect_to_world_safe(
+            Pw = depth_geometry.blue_rect_to_world_safe(
                 it["rect"], depth, search_step=2
             )
             ang = 0.0
