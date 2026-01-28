@@ -87,7 +87,22 @@ def save_cam():
         if obj_type == "green":
             cx, cy = depth_utils.box_center_pixel(it["poly"])
             Pw = coord.pixel_to_world(cx, cy, fake_depth)
-            ang = float(it["angle"])
+
+            # 1) detector에서 온 긴변 각도 (0~180, 90이 수직)
+            angle_long = float(it["angle"])
+
+            # 2) 수직 기준 signed 각도 (-90 ~ +90), 오른쪽 + / 왼쪽 -
+            angle_signed = angle_long - 90.0
+
+            # 3) 동치각 정리(안정성)
+            if angle_signed > 90.0:
+                angle_signed -= 180.0
+            elif angle_signed < -90.0:
+                angle_signed += 180.0
+
+            ang = angle_signed
+
+                        
         else:
             # blue: 안전 탐색 + angle=0.0
             Pw = depth_utils.blue_rect_to_world_safe(
