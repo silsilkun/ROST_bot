@@ -1,0 +1,694 @@
+# realsense_loop_style_pick_xyxy_Aplan_with_PCA_YAW.py
+# ✅ A안 (업그레이드 + PCA Yaw)
+# 1) adaptive band (MAD 기반)
+# 2) morphology close -> open
+# 3) blob score에 dist_max 포함 (얇은/비닐 자동 탈락)
+# 4) pick point: DT(dmax) + centroid soft pull
+# 5) ✅ grasp yaw: PCA 기반 주축 방향 → (픽셀 축) → 월드 XY로 투영해 yaw 계산
+
+import os
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+
+# =========================================================
+# FIXED: stream / windows / ROI (xyxy)
+# =========================================================
+WIDTH, HEIGHT, FPS = 1280, 720, 30
+WIN_W, WIN_H = 1280, 720
+ROI = (480, 127, 818, 350)  # (x1, y1, x2, y2)
+
+# Depth-based pick parameters
+DEPTH_MIN = 0.2
+DEPTH_MAX = 2.0
+
+TOP_PERCENT_PRIMARY = 3
+TOP_PERCENT_FALLBACK = 5
+
+# adaptive band clamp (meters)
+BAND_MIN_M = 0.008   # 0.8 cm
+BAND_MAX_M = 0.030   # 3.0 cm
+BAND_MAD_K = 3.0     # band = K * MAD
+
+MIN_AREA = 800
+D_MIN = 6
+
+SNAP_N = 3
+VALID_RATIO_MIN = 0.30
+Z_APPROACH_CM = 3.0
+
+# =========================================================
+# ✅ Pick-point selection params (DT + centroid soft pull)
+# =========================================================
+DT_KEEP_RATIO = 0.85     # 0.80~0.90 추천
+DT_CENTER_WEIGHT = 0.30  # 0.20~0.45 추천
+
+# =========================================================
+# ✅ PCA yaw params
+# =========================================================
+YAW_STEP_PX = 30                 # PCA 방향으로 두 번째 점 찍을 픽셀 거리
+PCA_MIN_POINTS = 100             # PCA 계산 최소 점 수
+PCA_ANISO_RATIO_MIN = 1.20       # e1/e2가 이보다 작으면 "거의 원형" → yaw 의미 약함(0 처리)
+
+# morphology
+MORPH_KERNEL = 3
+CLOSE_ITERS = 2
+OPEN_ITERS = 1
+
+# =========================================================
+# Coordinate (캘리브 기반, 너 코드 유지)
+# =========================================================
+SAVE_FILE = "camcalib.npz"
+
+R = 2
+M_TO_CM = 100.0
+FLIP_XYZ = (-1.0, -1.0, -1.0)
+OFFSET_CM = (81.5, 15.9, 0.0)
+
+_CALIB = None
+
+
+def load_calib():
+    global _CALIB
+    if _CALIB is not None:
+        return _CALIB
+    if not os.path.exists(SAVE_FILE):
+        raise FileNotFoundError(f"캘리브 파일 없음: {SAVE_FILE}")
+
+    data = np.load(SAVE_FILE)
+    _CALIB = {
+        "T": data["T_cam_to_work"].astype(np.float64),
+        "K": data["camera_matrix"].astype(np.float64),
+        "D": data["dist_coeffs"].astype(np.float64),
+    }
+    return _CALIB
+
+
+class Coordinate:
+    def __init__(self):
+        c = load_calib()
+        self.T = c["T"]
+        self.K = c["K"]
+        self.D = c["D"]
+
+    def pixel_to_world(self, u, v, depth_frame):
+        u = int(u)
+        v = int(v)
+
+        depths = []
+        for du in range(-R, R + 1):
+            for dv in range(-R, R + 1):
+                uu = u + du
+                vv = v + dv
+                if uu < 0 or uu >= WIDTH or vv < 0 or vv >= HEIGHT:
+                    continue
+                d = float(depth_frame.get_distance(uu, vv))
+                if d > 0.0:
+                    depths.append(d)
+
+        if not depths:
+            return None
+
+        Z = float(np.median(depths)) * M_TO_CM  # cm
+
+        fx, fy = float(self.K[0, 0]), float(self.K[1, 1])
+        cx, cy = float(self.K[0, 2]), float(self.K[1, 2])
+
+        pts = np.array([[[u, v]]], dtype=np.float32)
+        und = cv2.undistortPoints(pts, self.K, self.D, P=self.K)
+        uc, vc = und[0, 0]
+        uc, vc = float(uc), float(vc)
+
+        # ⚠️ 네가 "원본 축 매핑 유지"라고 한 형태 그대로 둠
+        # (표준 핀홀 축과 다를 수 있음. 로봇 축이 이상하면 여기부터 점검)
+        Yc = (uc - cx) * Z / fx
+        Xc = (vc - cy) * Z / fy
+        Pc = np.array([Xc, Yc, Z, 1.0], dtype=np.float64)
+
+        Pw = self.T @ Pc
+
+        # real env correction (기존 유지)
+        Pw[0] = FLIP_XYZ[0] * Pw[0] + OFFSET_CM[0]
+        Pw[1] = FLIP_XYZ[1] * Pw[1] + OFFSET_CM[1]
+        Pw[2] = FLIP_XYZ[2] * Pw[2] + OFFSET_CM[2]
+        return Pw
+
+
+# =========================================================
+# helpers
+# =========================================================
+def parse_roi_xyxy(roi_xyxy, img_w, img_h):
+    x1, y1, x2, y2 = map(int, roi_xyxy)
+
+    # clamp
+    x1 = max(0, min(img_w - 1, x1))
+    y1 = max(0, min(img_h - 1, y1))
+    x2 = max(0, min(img_w, x2))
+    y2 = max(0, min(img_h, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"ROI invalid after clamp: {(x1, y1, x2, y2)}")
+
+    x0, y0 = x1, y1
+    w, h = x2 - x1, y2 - y1
+    return x0, y0, w, h
+
+
+def _draw_points(img: np.ndarray, points, radius=6):
+    if not points:
+        return img
+    out = img.copy()
+    for p in points:
+        if len(p) < 2:
+            continue
+        x, y = int(p[0]), int(p[1])
+        cv2.circle(out, (x, y), radius, (0, 0, 255), -1)
+    return out
+
+
+def _draw_roi_xyxy(img: np.ndarray, roi_xyxy):
+    x1, y1, x2, y2 = map(int, roi_xyxy)
+    out = img.copy()
+    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    return out
+
+
+def _safe_bbox_from_mask(mask_bool):
+    ys, xs = np.where(mask_bool)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def robust_mad(x: np.ndarray):
+    if x.size == 0:
+        return 0.0
+    med = np.median(x)
+    return float(np.median(np.abs(x - med)))
+
+
+def make_top_mask(depth_roi: np.ndarray, valid_mask: np.ndarray, top_percent: float):
+    depth_valid = depth_roi[valid_mask]
+    if depth_valid.size == 0:
+        return None, None, None
+
+    z_top = float(np.percentile(depth_valid, top_percent))
+
+    mad = robust_mad(depth_valid)
+    band = float(np.clip(BAND_MAD_K * mad, BAND_MIN_M, BAND_MAX_M))
+
+    top_mask = (depth_roi <= (z_top + band)).astype(np.uint8)
+    return top_mask, z_top, band
+
+
+def clean_mask(mask_u8: np.ndarray):
+    k = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
+    out = mask_u8
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, k, iterations=CLOSE_ITERS)
+    out = cv2.morphologyEx(out, cv2.MORPH_OPEN,  k, iterations=OPEN_ITERS)
+    return out
+
+
+# =========================================================
+# Pick point selection (DT + centroid soft pull)
+# =========================================================
+def choose_pick_point_from_dist(
+    dist: np.ndarray,
+    mask_bool: np.ndarray,
+    center_weight: float = DT_CENTER_WEIGHT,
+    keep_ratio: float = DT_KEEP_RATIO,
+):
+    dmax = float(dist.max())
+    if dmax <= 0:
+        return None
+
+    # 전체 mask centroid
+    M = cv2.moments(mask_bool.astype(np.uint8))
+    if M["m00"] > 0:
+        xc = float(M["m10"] / M["m00"])
+        yc = float(M["m01"] / M["m00"])
+    else:
+        ys0, xs0 = np.where(mask_bool)
+        if xs0.size == 0:
+            return None
+        xc, yc = float(xs0.mean()), float(ys0.mean())
+
+    kr = float(np.clip(keep_ratio, 0.5, 0.99))
+    cand = (dist >= (kr * dmax)) & mask_bool
+    ys, xs = np.where(cand)
+
+    if xs.size == 0:
+        v0, u0 = np.unravel_index(int(dist.argmax()), dist.shape)
+        return int(u0), int(v0), dmax, float(dist[v0, u0]), kr, float(center_weight)
+
+    dx = (xs - xc)
+    dy = (ys - yc)
+    center_d2 = dx * dx + dy * dy
+    center_d2 = center_d2 / (float(center_d2.max()) + 1e-9)
+
+    dist_n = dist[ys, xs] / (dmax + 1e-9)
+
+    cw = float(np.clip(center_weight, 0.0, 1.0))
+    score = (1.0 - cw) * dist_n - cw * center_d2
+
+    k = int(np.argmax(score))
+    u, v = int(xs[k]), int(ys[k])
+    return u, v, dmax, float(dist[v, u]), kr, cw
+
+
+# =========================================================
+# ✅ PCA 기반 주축 방향 계산 (ROI 좌표계)
+# =========================================================
+def pca_axis_from_mask(mask_bool: np.ndarray):
+    ys, xs = np.where(mask_bool)
+    if xs.size < PCA_MIN_POINTS:
+        return None  # too few points
+
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    mean = pts.mean(axis=0)
+    pts0 = pts - mean
+
+    cov = np.cov(pts0.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+
+    order = np.argsort(eigvals)[::-1]
+    e1 = float(eigvals[order[0]])
+    e2 = float(eigvals[order[1]]) if eigvals.size > 1 else 0.0
+    v1 = eigvecs[:, order[0]]  # (vx, vy)
+
+    # 원형에 가까우면 yaw 의미 약함
+    ratio = (e1 / (e2 + 1e-9)) if e2 > 0 else 999.0
+
+    vx, vy = float(v1[0]), float(v1[1])
+    n = (vx * vx + vy * vy) ** 0.5 + 1e-9
+    vx, vy = vx / n, vy / n
+
+    return {
+        "vx": vx,
+        "vy": vy,
+        "mean_x": float(mean[0]),
+        "mean_y": float(mean[1]),
+        "e1": e1,
+        "e2": e2,
+        "ratio": ratio,
+        "yaw_img_rad": float(np.arctan2(vy, vx)),
+        "yaw_img_deg": float(np.degrees(np.arctan2(vy, vx))),
+    }
+
+
+def compute_world_yaw_from_pca(
+    u_img: int,
+    v_img: int,
+    pca_info: dict,
+    depth_frame,
+    coord: Coordinate,
+):
+    """
+    PCA 방향(픽셀 방향)을 월드 XY 방향으로 투영해서 yaw_work 계산.
+    - P1 = 픽 포인트 월드
+    - P2 = 픽셀 방향으로 step 이동한 점 월드
+    - yaw = atan2(dY, dX)  (work XY)
+    """
+    if pca_info is None:
+        return None
+
+    vx, vy = pca_info["vx"], pca_info["vy"]
+
+    u2 = int(np.clip(u_img + vx * YAW_STEP_PX, 0, WIDTH - 1))
+    v2 = int(np.clip(v_img + vy * YAW_STEP_PX, 0, HEIGHT - 1))
+
+    P1 = coord.pixel_to_world(u_img, v_img, depth_frame)
+    P2 = coord.pixel_to_world(u2, v2, depth_frame)
+    if P1 is None or P2 is None:
+        return None
+
+    dx = float(P2[0] - P1[0])
+    dy = float(P2[1] - P1[1])
+    if (dx * dx + dy * dy) < 1e-6:
+        return None
+
+    yaw = float(np.arctan2(dy, dx))
+    return {
+        "yaw_work_rad": yaw,
+        "yaw_work_deg": float(np.degrees(yaw)),
+        "u2": u2,
+        "v2": v2,
+        "dx": dx,
+        "dy": dy,
+    }
+
+
+# =========================================================
+# compute pick on snapshot (Spacebar)
+# =========================================================
+def compute_pick_snapshot(pipeline, align, roi_xyxy, coord: Coordinate):
+    x0, y0, w, h = parse_roi_xyxy(roi_xyxy, WIDTH, HEIGHT)
+
+    depths = []
+    snap_color = None
+    snap_depth_frame = None
+
+    for _ in range(SNAP_N):
+        frames = pipeline.wait_for_frames()
+        frames = align.process(frames)
+
+        color_f = frames.get_color_frame()
+        depth_f = frames.get_depth_frame()
+        if not color_f or not depth_f:
+            continue
+
+        if snap_color is None:
+            snap_color = np.asanyarray(color_f.get_data()).copy()
+        snap_depth_frame = depth_f
+
+        depth_m = np.asanyarray(depth_f.get_data()).astype(np.float32) * 0.001
+        depths.append(depth_m)
+
+    if snap_color is None or snap_depth_frame is None or len(depths) < max(1, SNAP_N // 2):
+        return {"ok": False, "msg": "SENSOR_BAD (no frames)"}
+
+    depth_snap = np.median(np.stack(depths, axis=0), axis=0)
+    depth_roi = depth_snap[y0:y0 + h, x0:x0 + w]
+
+    valid = (depth_roi > DEPTH_MIN) & (depth_roi < DEPTH_MAX)
+    valid_ratio = float(valid.sum()) / float(depth_roi.size)
+    if valid_ratio < VALID_RATIO_MIN:
+        return {"ok": False, "msg": f"SENSOR_BAD (valid_ratio={valid_ratio:.2f})", "snap_color": snap_color}
+
+    top_percent_used = TOP_PERCENT_PRIMARY
+    top_mask, z_top, band = make_top_mask(depth_roi, valid, TOP_PERCENT_PRIMARY)
+    if top_mask is None:
+        return {"ok": False, "msg": "NO_VALID_DEPTH", "snap_color": snap_color}
+
+    top_mask = clean_mask(top_mask)
+
+    if int(top_mask.sum()) < MIN_AREA:
+        top_percent_used = TOP_PERCENT_FALLBACK
+        top_mask, z_top, band = make_top_mask(depth_roi, valid, TOP_PERCENT_FALLBACK)
+        if top_mask is None:
+            return {"ok": False, "msg": "NO_VALID_DEPTH", "snap_color": snap_color}
+        top_mask = clean_mask(top_mask)
+
+    num, labels = cv2.connectedComponents(top_mask)
+
+    best = None
+    best_score = -1.0
+    best_bbox = None
+    best_area = 0
+    best_compact = 0.0
+    best_dmax = 0.0
+
+    for i in range(1, num):
+        mask = (labels == i)
+        area = int(mask.sum())
+        if area < MIN_AREA:
+            continue
+
+        bbox = _safe_bbox_from_mask(mask)
+        if bbox is None:
+            continue
+        xmin, ymin, xmax, ymax = bbox
+        bbox_area = float((xmax - xmin + 1) * (ymax - ymin + 1))
+        compact = float(area) / bbox_area
+
+        dist_i = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+        dmax_i = float(dist_i.max())
+        if dmax_i < D_MIN:
+            continue
+
+        score = (dmax_i ** 2) * compact
+
+        if score > best_score:
+            best_score = score
+            best = mask
+            best_bbox = bbox
+            best_area = area
+            best_compact = compact
+            best_dmax = dmax_i
+
+    if best is None:
+        return {"ok": False, "msg": "NO_PICK (no blob)", "snap_color": snap_color}
+
+    dist = cv2.distanceTransform(best.astype(np.uint8), cv2.DIST_L2, 5)
+    pick = choose_pick_point_from_dist(dist, best, DT_CENTER_WEIGHT, DT_KEEP_RATIO)
+    if pick is None:
+        return {"ok": False, "msg": "NO_PICK (bad dist)", "snap_color": snap_color}
+
+    u_roi, v_roi, dmax, chosen_d, kr, cw = pick
+    if chosen_d < D_MIN:
+        return {"ok": False, "msg": f"TOO_THIN (chosen_d={chosen_d:.1f})", "snap_color": snap_color}
+
+    u_img = x0 + int(u_roi)
+    v_img = y0 + int(v_roi)
+
+    Pw = coord.pixel_to_world(u_img, v_img, snap_depth_frame)
+    if Pw is None:
+        return {"ok": False, "msg": "XYZ_FAIL", "snap_color": snap_color}
+
+    X, Y, Z = float(Pw[0]), float(Pw[1]), float(Pw[2])
+    Z_approach = Z + Z_APPROACH_CM
+
+    # ✅ PCA yaw
+    pca_info = pca_axis_from_mask(best)
+    yaw_work = None
+    yaw_img = None
+    if pca_info is not None:
+        yaw_img = {"yaw_img_rad": pca_info["yaw_img_rad"], "yaw_img_deg": pca_info["yaw_img_deg"], "ratio": pca_info["ratio"]}
+        # 원형이면 yaw 의미 약함 → 0 처리(또는 None)
+        if pca_info["ratio"] >= PCA_ANISO_RATIO_MIN:
+            yaw_work = compute_world_yaw_from_pca(u_img, v_img, pca_info, snap_depth_frame, coord)
+        else:
+            yaw_work = {"yaw_work_rad": 0.0, "yaw_work_deg": 0.0, "u2": u_img, "v2": v_img, "dx": 0.0, "dy": 0.0}
+
+    xmin, ymin, xmax, ymax = best_bbox
+    bbox_img = (x0 + xmin, y0 + ymin, x0 + xmax, y0 + ymax)
+
+    return {
+        "ok": True,
+        "msg": "OK",
+        "u_img": u_img,
+        "v_img": v_img,
+        "bbox_img": bbox_img,
+        "xyz_approach": [X, Y, Z_approach],
+        "yaw_work": yaw_work,   # {"yaw_work_rad","yaw_work_deg",...} or None
+        "yaw_img": yaw_img,     # {"yaw_img_rad","yaw_img_deg","ratio"} or None
+        "debug": {
+            "valid_ratio": valid_ratio,
+            "top_percent": top_percent_used,
+            "z_top": float(z_top),
+            "band_m": float(band),
+            "best_area": best_area,
+            "best_compact": best_compact,
+            "best_dmax": float(best_dmax),
+            "dmax": float(dmax),
+            "chosen_d": float(chosen_d),
+            "dt_keep_ratio": float(kr),
+            "dt_center_weight": float(cw),
+            "pca_ratio": float(pca_info["ratio"]) if pca_info is not None else 0.0,
+        },
+        "snap_color": snap_color,
+    }
+
+
+def render_result_view(res, roi_xyxy):
+    img = res.get("snap_color", None)
+    if img is None:
+        canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        cv2.putText(canvas, "NO IMAGE", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 255), 3)
+        return canvas
+
+    out = img.copy()
+
+    # ROI
+    x1, y1, x2, y2 = map(int, roi_xyxy)
+    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    if not res.get("ok", False):
+        cv2.putText(out, res.get("msg", "FAIL"), (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3)
+        return out
+
+    # bbox
+    bx1, by1, bx2, by2 = res["bbox_img"]
+    cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
+
+    # pick point
+    u, v = res["u_img"], res["v_img"]
+    cv2.circle(out, (u, v), 8, (0, 0, 255), -1)
+
+    # yaw arrow (work yaw가 있을 때: 픽셀 방향 화살표도 함께 그려줌)
+    yw = res.get("yaw_work", None)
+    if yw is not None and "u2" in yw:
+        u2, v2 = int(yw["u2"]), int(yw["v2"])
+        if (u2, v2) != (u, v):
+            cv2.arrowedLine(out, (u, v), (u2, v2), (255, 0, 0), 2, tipLength=0.2)
+
+    # text
+    X, Y, Zapp = res["xyz_approach"]
+    dbg = res.get("debug", {})
+
+    cv2.putText(out, f"uv=({u},{v})", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    cv2.putText(out, f"XYZ_approach=[{X:.1f},{Y:.1f},{Zapp:.1f}] cm", (30, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+    if yw is not None:
+        cv2.putText(out, f"yaw_work={yw['yaw_work_deg']:.1f} deg", (30, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+    else:
+        cv2.putText(out, f"yaw_work=None", (30, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+
+    cv2.putText(out,
+                f"valid={dbg.get('valid_ratio',0):.2f} top%={dbg.get('top_percent',0)} band={dbg.get('band_m',0)*100:.1f}cm",
+                (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    cv2.putText(out,
+                f"area={dbg.get('best_area',0)} comp={dbg.get('best_compact',0):.2f} bestD={dbg.get('best_dmax',0):.1f}px chosenD={dbg.get('chosen_d',0):.1f}px",
+                (30, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    cv2.putText(out,
+                f"keep={dbg.get('dt_keep_ratio',0):.2f} center_w={dbg.get('dt_center_weight',0):.2f} pca_ratio={dbg.get('pca_ratio',0):.2f}",
+                (30, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    return out
+
+
+# =========================================================
+# RealSense loop (callbacks)
+# =========================================================
+def run(
+    width=WIDTH,
+    height=HEIGHT,
+    fps=FPS,
+    on_save=None,
+    on_reset=None,
+    on_click=None,
+    update_depth_frame=None,
+    update_color_image=None,
+    get_points=None,
+):
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+    config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+
+    align = rs.align(rs.stream.color)
+
+    live_name = "LIVE"
+    result_name = "RESULT"
+
+    cv2.namedWindow(live_name, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(result_name, cv2.WINDOW_AUTOSIZE)
+
+    if on_click is not None:
+        cv2.setMouseCallback(live_name, on_click)
+
+    print("SPACE: 계산 | r: 리셋 | esc/q: 종료")
+
+    try:
+        pipeline.start(config)
+
+        while True:
+            frames = pipeline.wait_for_frames()
+            frames = align.process(frames)
+
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            if not color_frame or not depth_frame:
+                continue
+
+            color_image = np.asanyarray(color_frame.get_data())
+
+            if update_depth_frame is not None:
+                update_depth_frame(depth_frame)
+            if update_color_image is not None:
+                update_color_image(color_image)
+
+            display = _draw_roi_xyxy(color_image, ROI)
+
+            if get_points is not None:
+                pts = get_points()
+                if pts:
+                    display = _draw_points(display, pts)
+
+            cv2.imshow(live_name, display)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+            elif key == ord("r") and on_reset:
+                on_reset()
+                continue
+            elif key == ord(" ") and on_save:
+                on_save(pipeline, align)
+                continue
+
+    finally:
+        pipeline.stop()
+        cv2.destroyAllWindows()
+        print("RealSense 종료")
+
+
+# =========================================================
+# App state + callbacks
+# =========================================================
+class App:
+    def __init__(self):
+        self.depth_frame = None
+        self.color_image = None
+        self.points = []
+        self.coord = Coordinate()
+
+    def update_depth_frame(self, df):
+        self.depth_frame = df
+
+    def update_color_image(self, img):
+        self.color_image = img
+
+    def get_points(self):
+        return self.points
+
+    def on_reset(self):
+        self.points = []
+        blank = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        cv2.putText(blank, "RESET", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 3)
+        cv2.imshow("RESULT", blank)
+        print("RESET")
+
+    def on_save(self, pipeline, align):
+        res = compute_pick_snapshot(pipeline, align, ROI, self.coord)
+
+        if res.get("ok", False):
+            self.points = [(res["u_img"], res["v_img"])]
+
+            # 로봇으로 보낼 값 예시(여기서 SEND)
+            xyz = res["xyz_approach"]
+            yaw = res.get("yaw_work", None)
+            if yaw is not None:
+                print(f"SEND → xyz={xyz} yaw_deg={yaw['yaw_work_deg']:.1f}")
+            else:
+                print(f"SEND → xyz={xyz} yaw_deg=None")
+        else:
+            self.points = []
+            print(res.get("msg", "FAIL"))
+
+        view = render_result_view(res, ROI)
+        cv2.imshow("RESULT", view)
+
+    def on_click(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            print(f"CLICK: ({x},{y})")
+
+
+if __name__ == "__main__":
+    app = App()
+    run(
+        width=WIDTH,
+        height=HEIGHT,
+        fps=FPS,
+        on_save=app.on_save,
+        on_reset=app.on_reset,
+        on_click=app.on_click,
+        update_depth_frame=app.update_depth_frame,
+        update_color_image=app.update_color_image,
+        get_points=app.get_points,
+    )
