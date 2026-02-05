@@ -16,6 +16,7 @@ WIN_RESULT = "RESULT"
 ROI_XYXY = (485, 135, 800, 350)
 
 WARMUP_FIRST_SPACE_N = 20
+CM_TO_MM = 10.0
 
 
 class CameraLoop:
@@ -32,8 +33,9 @@ class CameraLoop:
         self.latest_depth_m = None
         self._warmed_once = False
 
-        # main/ROS에서 쉽게 꺼낼 "정리된 결과"
-        # {"ok": bool, "color_path": str, "flat_clicked_xy": list|None, "xyz_angle": list|None}
+        # {"ok": bool, "color_path": str|None, "flat_clicked_xy": list|None, "xyz_angle": list|None}
+        # flat_clicked_xy: [[X_mm, Y_mm], ...]
+        # xyz_angle: [X_mm, Y_mm, Zapp_mm, yaw_deg]
         self.last_payload = None
 
     def get_frame(self):
@@ -119,22 +121,32 @@ class CameraLoop:
 
                     result = self.pipeline.run(snapshot=snap, clicked_uv=self.events.clicked_uv, roi_xyxy=ROI_XYXY)
 
-                    # main/ROS용: 여기서 "3개만" 뽑아 정리해서 저장
-                    xyz = result.get("xyz_angle")
+                    # xyz_angle: cm -> mm
+                    xyz = result.get("xyz_angle")  # (X_cm, Y_cm, Zapp_cm, yaw_deg) or None
+                    xyz_mm = None
+                    if xyz is not None:
+                        X_cm, Y_cm, Zapp_cm, yaw_deg = xyz
+                        xyz_mm = [X_cm * CM_TO_MM, Y_cm * CM_TO_MM, Zapp_cm * CM_TO_MM, yaw_deg]
+
+                    # flat_clicked_xy: cm -> mm
+                    flat_cm = result.get("flat_clicked_xy")  # [[x_cm, y_cm], ...] or None
+                    flat_mm = None
+                    if flat_cm is not None:
+                        flat_mm = [[x * CM_TO_MM, y * CM_TO_MM] for x, y in flat_cm]
+                    # ros용 저장 이곳을 보고 가져가시오
                     self.last_payload = {
                         "ok": bool(result.get("ok", False)),
                         "color_path": out_color,
-                        "flat_clicked_xy": result.get("flat_clicked_xy"),
-                        "xyz_angle": list(xyz) if xyz is not None else None,
+                        "flat_clicked_xy": flat_mm,
+                        "xyz_angle": xyz_mm,
                     }
 
-                    # prints (기능 유지)
-                    if result["flat_clicked_xy"] is not None:
-                        print(f"flat_clicked_xy: {result['flat_clicked_xy']}")
+                    # prints (mm 기준)
+                    if self.last_payload["flat_clicked_xy"] is not None:
+                        print(f"flat_clicked_xy_mm={self.last_payload['flat_clicked_xy']}")
 
-                    if result["ok"] and result["xyz_angle"] is not None:
-                        X, Y, Zapp, angle = result["xyz_angle"]
-                        print(f"xyz_angle={[X, Y, Zapp, angle]}")
+                    if self.last_payload["ok"] and self.last_payload["xyz_angle"] is not None:
+                        print(f"xyz_angle_mm={self.last_payload['xyz_angle']}")
                     else:
                         print("FAIL")
 
@@ -144,7 +156,7 @@ class CameraLoop:
                         ok=result["ok"],
                         u=result["u"],
                         v=result["v"],
-                        xyz_angle=result["xyz_angle"],
+                        xyz_angle=result["xyz_angle"],  # UI 표시는 기존 cm 유지(원하면 render쪽도 바꿀 수 있음)
                         u2v2=result["u2v2"],
                     )
                     cv2.imshow(WIN_RESULT, view)

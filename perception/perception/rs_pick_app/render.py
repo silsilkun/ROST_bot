@@ -32,7 +32,7 @@ def render_result_view(color_img, roi_xyxy, ok, u, v, xyz_angle, u2v2):
     cv2.putText(out, f"uv=({int(u)},{int(v)})", (30, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
 
-    txt = f"xyz=[{X:.3f},{Y:.3f},{Zapp:.3f},{angle:.1f}]"
+    txt = f"xyz=[{X:.1f},{Y:.1f},{Zapp:.1f},{angle:.1f}]"
     cv2.putText(out, txt, (30, 105),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
 
